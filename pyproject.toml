@@ -1,0 +1,23 @@
+[project]
+name = "abax"
+version = "0.1.0"
+description = "Agent + GenUI framework experiment — sandbox gateway for bookkeeping"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "docker>=7.0.0",
+    "websockets>=14.0",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "httpx>=0.28.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
