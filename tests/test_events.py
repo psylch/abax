@@ -111,12 +111,14 @@ async def test_sse_route_exists(client):
 async def test_create_sandbox_emits_event(client):
     """Creating a sandbox publishes a sandbox.created event."""
     from gateway.events import bus
+    from tests.conftest import _wait_for_daemon
 
     # Subscribe before creating
     # We don't know the sandbox_id yet, so we'll check after
     r = await client.post("/sandboxes", json={"user_id": "test-events"})
     assert r.status_code == 200
     sid = r.json()["sandbox_id"]
+    await _wait_for_daemon(sid)
 
     # For the next operation, subscribe first, then act
     q = bus.subscribe(sid)

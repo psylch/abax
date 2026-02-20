@@ -1,44 +1,44 @@
 import asyncio
 import json
-import shlex
 import time
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from gateway.daemon import request_sync
 from gateway.models import ExecResult
 from gateway.sandbox import get_container
 
 
-def _exec_sync(sandbox_id: str, command: str, timeout: int = 30) -> ExecResult:
-    container = get_container(sandbox_id)
-    wrapped = f"timeout {timeout} bash -c {shlex.quote(command)}"
+async def exec_command(sandbox_id: str, command: str, timeout: int = 30) -> ExecResult:
+    """Execute a command via the in-container daemon."""
     start = time.monotonic()
-    exit_code, output = container.exec_run(
-        ["bash", "-c", wrapped],
-        demux=True,
+    data = await asyncio.wait_for(
+        asyncio.to_thread(
+            request_sync,
+            sandbox_id,
+            "POST",
+            "/exec",
+            {"command": command, "timeout": timeout},
+            timeout + 5,  # curl max-time: command timeout + 5s grace
+        ),
+        timeout=timeout + 10,  # async fallback
     )
     duration_ms = int((time.monotonic() - start) * 1000)
 
-    stdout = output[0].decode("utf-8", errors="replace") if output[0] else ""
-    stderr = output[1].decode("utf-8", errors="replace") if output[1] else ""
-
     return ExecResult(
-        stdout=stdout,
-        stderr=stderr,
-        exit_code=exit_code,
+        stdout=data.get("stdout", ""),
+        stderr=data.get("stderr", ""),
+        exit_code=data.get("exit_code", -1),
         duration_ms=duration_ms,
     )
 
 
-async def exec_command(sandbox_id: str, command: str, timeout: int = 30) -> ExecResult:
-    return await asyncio.wait_for(
-        asyncio.to_thread(_exec_sync, sandbox_id, command, timeout),
-        timeout=timeout + 5,  # async fallback: 5s grace over container-level timeout
-    )
-
-
 async def stream_command(sandbox_id: str, websocket: WebSocket):
-    """Stream stays as-is — it already yields to the event loop via await websocket.send_json."""
+    """Stream command output via WebSocket.
+
+    For streaming, we still use docker exec directly since WebSocket proxying
+    through curl is impractical. The daemon handles non-streaming exec.
+    """
     await websocket.accept()
 
     try:
@@ -60,7 +60,6 @@ async def stream_command(sandbox_id: str, websocket: WebSocket):
             stderr=True,
         )
 
-        # Run the blocking iterator in a thread, push chunks to a queue
         queue: asyncio.Queue[str | None] = asyncio.Queue()
 
         def _stream():
@@ -68,7 +67,7 @@ async def stream_command(sandbox_id: str, websocket: WebSocket):
             for chunk in output:
                 text = chunk.decode("utf-8", errors="replace")
                 queue.put_nowait(text)
-            queue.put_nowait(None)  # sentinel
+            queue.put_nowait(None)
 
         stream_task = asyncio.get_event_loop().run_in_executor(None, _stream)
 
@@ -78,7 +77,7 @@ async def stream_command(sandbox_id: str, websocket: WebSocket):
                 break
             await websocket.send_json({"type": "stdout", "data": text})
 
-        await stream_task  # ensure thread is done
+        await stream_task
 
         inspect = await asyncio.to_thread(
             container.client.api.exec_inspect, exec_instance["Id"]

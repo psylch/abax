@@ -2,43 +2,58 @@ import asyncio
 import hashlib
 import hmac
 import io
-import json
 import os
 import tarfile
 import time
 
+from gateway.daemon import request_sync
 from gateway.sandbox import get_container
 
 SIGN_SECRET = os.getenv("ABAX_SIGN_SECRET", "dev-secret-change-in-prod")
 SIGN_EXPIRY = 3600
 
 
-def _read_file_sync(sandbox_id: str, path: str) -> str:
-    container = get_container(sandbox_id)
-    exit_code, output = container.exec_run(["cat", path])
-    if exit_code != 0:
-        raise FileNotFoundError(f"{path}: {output.decode('utf-8', errors='replace')}")
-    return output.decode("utf-8", errors="replace")
-
-
 async def read_file(sandbox_id: str, path: str) -> str:
-    return await asyncio.to_thread(_read_file_sync, sandbox_id, path)
-
-
-def _write_file_sync(sandbox_id: str, path: str, content: str) -> None:
-    container = get_container(sandbox_id)
-    data = content.encode("utf-8")
-    tarstream = io.BytesIO()
-    tarinfo = tarfile.TarInfo(name=os.path.basename(path))
-    tarinfo.size = len(data)
-    with tarfile.open(fileobj=tarstream, mode="w") as tar:
-        tar.addfile(tarinfo, io.BytesIO(data))
-    tarstream.seek(0)
-    container.put_archive(os.path.dirname(path) or "/", tarstream)
+    """Read a text file via the daemon."""
+    url_path = path.lstrip("/")
+    data = await asyncio.to_thread(
+        request_sync, sandbox_id, "GET", f"/files/{url_path}"
+    )
+    if "error" in data:
+        raise FileNotFoundError(data["error"])
+    return data["content"]
 
 
 async def write_file(sandbox_id: str, path: str, content: str) -> None:
-    await asyncio.to_thread(_write_file_sync, sandbox_id, path, content)
+    """Write a text file via the daemon."""
+    url_path = path.lstrip("/")
+    data = await asyncio.to_thread(
+        request_sync, sandbox_id, "PUT", f"/files/{url_path}", {"content": content}
+    )
+    if "error" in data:
+        raise PermissionError(data["error"])
+
+
+async def list_dir(sandbox_id: str, path: str) -> list[dict]:
+    """List directory contents via the daemon."""
+    url_path = path.lstrip("/")
+    data = await asyncio.to_thread(
+        request_sync, sandbox_id, "GET", f"/ls/{url_path}"
+    )
+    if "error" in data:
+        raise FileNotFoundError(data["error"])
+    return data["entries"]
+
+
+async def batch_file_ops(sandbox_id: str, operations: list[dict]) -> list[dict]:
+    """Perform batch file operations via the daemon."""
+    data = await asyncio.to_thread(
+        request_sync, sandbox_id, "POST", "/files/batch", {"operations": operations}
+    )
+    return data["results"]
+
+
+# --- Binary file operations (keep using Docker API for efficiency) ---
 
 
 def _read_file_bytes_sync(sandbox_id: str, path: str) -> tuple[bytes, str]:
@@ -58,35 +73,7 @@ async def read_file_bytes(sandbox_id: str, path: str) -> tuple[bytes, str]:
     return await asyncio.to_thread(_read_file_bytes_sync, sandbox_id, path)
 
 
-_LIST_DIR_SCRIPT = """
-import os, json, sys
-p = sys.argv[1]
-entries = [
-    {"name": e, "is_dir": os.path.isdir(os.path.join(p, e)),
-     "size": os.path.getsize(os.path.join(p, e)) if not os.path.isdir(os.path.join(p, e)) else -1}
-    for e in sorted(os.listdir(p))
-]
-print(json.dumps(entries))
-""".strip()
-
-
-def _list_dir_sync(sandbox_id: str, path: str) -> list[dict]:
-    """List directory contents inside the container."""
-    container = get_container(sandbox_id)
-    exit_code, output = container.exec_run(
-        ["python3", "-c", _LIST_DIR_SCRIPT, path]
-    )
-    if exit_code != 0:
-        raise FileNotFoundError(f"{path}: {output.decode('utf-8', errors='replace')}")
-    return json.loads(output.decode("utf-8"))
-
-
-async def list_dir(sandbox_id: str, path: str) -> list[dict]:
-    return await asyncio.to_thread(_list_dir_sync, sandbox_id, path)
-
-
 def _write_file_bytes_sync(sandbox_id: str, path: str, data: bytes) -> None:
-    """Write binary data to a file inside the container."""
     container = get_container(sandbox_id)
     tarstream = io.BytesIO()
     tarinfo = tarfile.TarInfo(name=os.path.basename(path))
@@ -99,6 +86,9 @@ def _write_file_bytes_sync(sandbox_id: str, path: str, data: bytes) -> None:
 
 async def write_file_bytes(sandbox_id: str, path: str, data: bytes) -> None:
     await asyncio.to_thread(_write_file_bytes_sync, sandbox_id, path, data)
+
+
+# --- Download token (unchanged) ---
 
 
 def generate_download_token(sandbox_id: str, path: str) -> str:

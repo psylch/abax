@@ -146,3 +146,18 @@ async def destroy_sandbox(sandbox_id: str) -> None:
 def get_container(sandbox_id: str):
     """Get the raw docker container object for exec operations."""
     return client.containers.get(sandbox_id)
+
+
+async def get_container_ip(sandbox_id: str) -> str:
+    """Get the container's internal IP address on the bridge network."""
+    def _get_ip():
+        container = client.containers.get(sandbox_id)
+        container.reload()
+        networks = container.attrs["NetworkSettings"]["Networks"]
+        # Use the first available network (typically 'bridge')
+        for net_name, net_info in networks.items():
+            ip = net_info.get("IPAddress")
+            if ip:
+                return ip
+        raise RuntimeError(f"No IP address found for container {sandbox_id}")
+    return await asyncio.to_thread(_get_ip)

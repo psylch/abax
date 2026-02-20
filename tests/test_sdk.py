@@ -4,6 +4,7 @@ import httpx
 from httpx import ASGITransport
 from gateway.main import app
 from sdk.sandbox import Sandbox
+from tests.conftest import _wait_for_daemon
 
 
 @pytest.fixture
@@ -13,7 +14,9 @@ async def sdk_sandbox():
     client = httpx.AsyncClient(transport=transport, base_url="http://test", timeout=60)
     r = await client.post("/sandboxes", json={"user_id": "sdk-test"})
     r.raise_for_status()
-    sb = Sandbox(r.json()["sandbox_id"], client=client)
+    sid = r.json()["sandbox_id"]
+    await _wait_for_daemon(sid)
+    sb = Sandbox(sid, client=client)
     yield sb
     try:
         await sb.destroy()
@@ -46,6 +49,9 @@ async def test_sdk_pause_resume(sdk_sandbox):
 
     info = await sdk_sandbox.resume()
     assert info["status"] == "running"
+
+    # Wait for daemon to recover after resume
+    await _wait_for_daemon(sdk_sandbox.sandbox_id)
 
     # Exec should work after resume
     result = await sdk_sandbox.exec("echo after-resume")

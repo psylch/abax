@@ -1,4 +1,4 @@
-"""Stress tests — extreme scenarios to find breaking points.
+"""Stress tests -- extreme scenarios to find breaking points.
 
 Run separately: ABAX_POOL_SIZE=0 python -m pytest tests/test_stress.py -v
 """
@@ -10,6 +10,7 @@ from httpx import ASGITransport, AsyncClient
 from gateway.main import app
 from gateway.sandbox import LABEL_PREFIX, client as docker_client
 from sdk.sandbox import Sandbox
+from tests.conftest import _wait_for_daemon
 
 
 def _cleanup_all_stress_containers():
@@ -88,6 +89,7 @@ async def test_rapid_concurrent_exec(stress_client):
     r = await stress_client.post("/sandboxes", json={"user_id": "stress-exec"})
     assert r.status_code == 200
     sid = r.json()["sandbox_id"]
+    await _wait_for_daemon(sid)
 
     tasks = [
         stress_client.post(
@@ -118,6 +120,7 @@ async def test_large_file_write_read(stress_client):
     r = await stress_client.post("/sandboxes", json={"user_id": "stress-file"})
     assert r.status_code == 200
     sb = Sandbox(r.json()["sandbox_id"], client=stress_client)
+    await _wait_for_daemon(sb.sandbox_id)
 
     # 1MB of text
     large_content = "A" * (1024 * 1024)
@@ -134,6 +137,7 @@ async def test_many_small_files(stress_client):
     r = await stress_client.post("/sandboxes", json={"user_id": "stress-manyfiles"})
     assert r.status_code == 200
     sb = Sandbox(r.json()["sandbox_id"], client=stress_client)
+    await _wait_for_daemon(sb.sandbox_id)
 
     tasks = [
         sb.files.write(f"/workspace/file_{i:03d}.txt", f"content-{i}")
@@ -154,10 +158,11 @@ async def test_many_small_files(stress_client):
 
 @pytest.mark.asyncio
 async def test_rapid_pause_resume_cycles(stress_client):
-    """Pause and resume 10 times in a row — verify sandbox still works after."""
+    """Pause and resume 10 times in a row -- verify sandbox still works after."""
     r = await stress_client.post("/sandboxes", json={"user_id": "stress-pause"})
     assert r.status_code == 200
     sb = Sandbox(r.json()["sandbox_id"], client=stress_client)
+    await _wait_for_daemon(sb.sandbox_id)
 
     for cycle in range(10):
         info = await sb.pause()
@@ -178,11 +183,12 @@ async def test_rapid_pause_resume_cycles(stress_client):
 
 @pytest.mark.asyncio
 async def test_rapid_create_destroy_cycles(stress_client):
-    """Create and destroy 10 sandboxes sequentially — no leaks."""
+    """Create and destroy 10 sandboxes sequentially -- no leaks."""
     for i in range(10):
         r = await stress_client.post("/sandboxes", json={"user_id": "stress-cycle"})
         assert r.status_code == 200, f"Cycle {i}: create failed with {r.status_code}"
         sid = r.json()["sandbox_id"]
+        await _wait_for_daemon(sid)
 
         r = await stress_client.post(
             f"/sandboxes/{sid}/exec",
@@ -250,10 +256,11 @@ async def test_sse_queue_overflow():
 
 @pytest.mark.asyncio
 async def test_timeout_under_concurrent_load(stress_client):
-    """Mix of fast and slow commands — fast ones complete, slow ones timeout."""
+    """Mix of fast and slow commands -- fast ones complete, slow ones timeout."""
     r = await stress_client.post("/sandboxes", json={"user_id": "stress-timeout"})
     assert r.status_code == 200
     sid = r.json()["sandbox_id"]
+    await _wait_for_daemon(sid)
 
     # 5 fast + 2 slow (timeout at 3s)
     fast_tasks = [
@@ -346,10 +353,11 @@ async def test_double_pause_returns_409(stress_client):
 
 @pytest.mark.asyncio
 async def test_concurrent_file_writes_same_path(stress_client):
-    """10 concurrent writes to the same file — result is one of the values, not corrupted."""
+    """10 concurrent writes to the same file -- result is one of the values, not corrupted."""
     r = await stress_client.post("/sandboxes", json={"user_id": "stress-race"})
     assert r.status_code == 200
     sb = Sandbox(r.json()["sandbox_id"], client=stress_client)
+    await _wait_for_daemon(sb.sandbox_id)
 
     tasks = [
         sb.files.write("/workspace/race.txt", f"writer-{i}")

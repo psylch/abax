@@ -70,3 +70,78 @@ class BrowserClickRequest(BaseModel):
 class BrowserTypeRequest(BaseModel):
     selector: str = Field(min_length=1, max_length=1024)
     text: str = Field(max_length=65536)
+
+
+# --- Batch file operations ---
+
+
+class FileBatchOp(BaseModel):
+    op: str = Field(pattern=r"^(read|write|list)$")
+    path: str = Field(min_length=1)
+    content: str | None = None
+
+
+class FileBatchRequest(BaseModel):
+    operations: list[FileBatchOp] = Field(min_length=1, max_length=100)
+
+
+# --- Session / message models ---
+
+
+class CreateSessionRequest(BaseModel):
+    user_id: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_\-]+$")
+    title: str | None = None
+
+
+class SessionInfo(BaseModel):
+    session_id: str
+    user_id: str
+    title: str | None = None
+    sandbox_id: str | None = None
+    created_at: float
+    last_active_at: float
+
+
+class MessageRequest(BaseModel):
+    role: str = Field(min_length=1, max_length=32)
+    content: str = Field(min_length=1, max_length=10 * 1024 * 1024)
+    tool_calls: str | None = None
+    tool_results: str | None = None
+
+
+class MessageInfo(BaseModel):
+    id: int
+    session_id: str
+    role: str
+    content: str
+    tool_calls: str | None = None
+    tool_results: str | None = None
+    created_at: float
+
+
+class SessionHistoryResponse(BaseModel):
+    session_id: str
+    messages: list[MessageInfo]
+
+
+# --- Chat / Agent models ---
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=10 * 1024 * 1024)
+
+
+class ChatResponse(BaseModel):
+    response: str
+    tier: str  # "tier1", "tier2", "tier3"
+    sandbox_id: str | None = None
+    tool_calls_count: int = 0
+
+
+class LLMProxyRequest(BaseModel):
+    model: str
+    max_tokens: int = 4096
+    system: str | None = None
+    messages: list[dict]
+    tools: list[dict] | None = None
+    stream: bool = False

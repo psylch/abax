@@ -14,10 +14,16 @@ from gateway.models import (
     HealthResponse, SandboxInfo, DirListing, DirEntry,
     BrowserNavigateRequest, BrowserScreenshotRequest,
     BrowserClickRequest, BrowserTypeRequest,
+    FileBatchRequest,
+    CreateSessionRequest, SessionInfo, MessageRequest, MessageInfo,
+    SessionHistoryResponse,
+    ChatRequest, ChatResponse, LLMProxyRequest,
 )
 from gateway import sandbox, executor, files, browser
 from gateway.sandbox import SandboxStateError
 from gateway.auth import verify_api_key
+from gateway.agent import handle_chat_message
+from gateway.llm_proxy import proxy_llm_request
 from gateway.events import publish as emit_event, sse_stream
 from gateway.gc import gc_loop, collect_garbage
 from gateway.logging_config import setup_logging, request_id_var, sandbox_id_var
@@ -224,6 +230,7 @@ async def resume_sandbox(sandbox_id: str, _=Auth):
 async def destroy_sandbox(sandbox_id: str, _=Auth):
     try:
         await sandbox.destroy_sandbox(sandbox_id)
+        store.clear_session_container(sandbox_id)
         store.unregister(sandbox_id)
         await emit_event(sandbox_id, "sandbox.destroyed")
     except NotFound:
@@ -328,6 +335,20 @@ async def list_dir(sandbox_id: str, path: str, _=Auth):
         raise HTTPException(404, str(e))
 
 
+# --- Batch file operations ---
+
+
+@app.post("/sandboxes/{sandbox_id}/files-batch")
+async def batch_file_ops(sandbox_id: str, req: FileBatchRequest, _=Auth):
+    try:
+        store.record_activity(sandbox_id)
+        ops = [op.model_dump() for op in req.operations]
+        results = await files.batch_file_ops(sandbox_id, ops)
+        return {"results": results}
+    except NotFound:
+        raise HTTPException(404, "sandbox not found")
+
+
 # --- Binary file upload ---
 
 
@@ -417,3 +438,80 @@ async def sandbox_events(sandbox_id: str, _=Auth):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# --- Session management ---
+
+
+@app.post("/sessions", response_model=SessionInfo)
+async def create_session(req: CreateSessionRequest, _=Auth):
+    info = store.create_session(req.user_id, req.title)
+    return SessionInfo(**info)
+
+
+@app.get("/sessions", response_model=list[SessionInfo])
+async def list_sessions(user_id: str, _=Auth):
+    rows = store.list_sessions(user_id)
+    return [SessionInfo(**r) for r in rows]
+
+
+@app.get("/sessions/{session_id}", response_model=SessionInfo)
+async def get_session(session_id: str, _=Auth):
+    info = store.get_session(session_id)
+    if info is None:
+        raise HTTPException(404, "session not found")
+    return SessionInfo(**info)
+
+
+@app.get("/sessions/{session_id}/history", response_model=SessionHistoryResponse)
+async def get_session_history(session_id: str, _=Auth):
+    info = store.get_session(session_id)
+    if info is None:
+        raise HTTPException(404, "session not found")
+    messages = store.load_history(session_id)
+    return SessionHistoryResponse(
+        session_id=session_id,
+        messages=[MessageInfo(**m) for m in messages],
+    )
+
+
+@app.post("/sessions/{session_id}/messages", response_model=MessageInfo)
+async def save_message(session_id: str, req: MessageRequest, _=Auth):
+    info = store.get_session(session_id)
+    if info is None:
+        raise HTTPException(404, "session not found")
+    msg = store.save_message(
+        session_id, req.role, req.content, req.tool_calls, req.tool_results
+    )
+    return MessageInfo(**msg)
+
+
+# --- Agent chat ---
+
+
+@app.post("/sessions/{session_id}/chat", response_model=ChatResponse)
+async def chat(session_id: str, req: ChatRequest, _=Auth):
+    info = store.get_session(session_id)
+    if info is None:
+        raise HTTPException(404, "session not found")
+    user_id = info["user_id"]
+    try:
+        result = await handle_chat_message(session_id, user_id, req.message)
+        return ChatResponse(**result)
+    except Exception as e:
+        logger.error("Chat error: %s", e, exc_info=True)
+        raise HTTPException(500, f"Agent error: {e}")
+
+
+# --- LLM Proxy (for in-container daemon) ---
+
+
+@app.post("/llm/proxy")
+async def llm_proxy(req: LLMProxyRequest, request: Request):
+    # Only allow requests from Docker internal network (container IPs)
+    client_ip = request.client.host if request.client else ""
+    if not (client_ip.startswith("172.") or client_ip.startswith("10.") or client_ip == "127.0.0.1"):
+        raise HTTPException(403, "LLM proxy is only accessible from internal network")
+    body = req.model_dump(exclude_none=True)
+    stream = body.pop("stream", False)
+    return await proxy_llm_request(body, stream=stream)

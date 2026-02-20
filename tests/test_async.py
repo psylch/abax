@@ -1,6 +1,7 @@
 """Test that gateway operations don't block the event loop."""
 import asyncio
 import pytest
+from tests.conftest import _wait_for_daemon
 
 
 @pytest.mark.asyncio
@@ -11,6 +12,7 @@ async def test_concurrent_health_during_exec(client):
     sid = r.json()["sandbox_id"]
 
     try:
+        await _wait_for_daemon(sid)
         slow_exec = client.post(
             f"/sandboxes/{sid}/exec",
             json={"command": "sleep 2 && echo done", "timeout": 10},

@@ -46,6 +46,7 @@ async def collect_garbage(
             cid = container.id[:12]
             logger.info("GC removing exited container %s", cid)
             container.remove(force=True)
+            store.clear_session_container(cid)
             store.unregister(cid)
             removed.append(cid)
 
@@ -67,6 +68,7 @@ async def collect_garbage(
                 logger.info("GC removed idle container %s", sid)
             except docker.errors.NotFound:
                 logger.info("GC idle container %s already gone", sid)
+            store.clear_session_container(sid)
             store.unregister(sid)
             removed.append(sid)
 
@@ -100,6 +102,7 @@ async def collect_garbage(
                         container.remove(force=True)
                     except docker.errors.NotFound:
                         logger.info("GC long-paused container %s already gone", cid)
+                    store.clear_session_container(cid)
                     store.unregister(cid)
                     removed.append(cid)
 

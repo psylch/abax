@@ -12,6 +12,7 @@ dependencies = [
     "anthropic>=0.42.0",
     "httpx>=0.28.0",
     "prometheus_client>=0.21.0",
+    "PyJWT>=2.8.0",
 ]
 
 [project.optional-dependencies]
