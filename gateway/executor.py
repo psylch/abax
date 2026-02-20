@@ -1,4 +1,6 @@
+import asyncio
 import json
+import shlex
 import time
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -7,12 +9,13 @@ from gateway.models import ExecResult
 from gateway.sandbox import get_container
 
 
-def exec_command(sandbox_id: str, command: str, timeout: int = 30) -> ExecResult:
+def _exec_sync(sandbox_id: str, command: str, timeout: int = 30) -> ExecResult:
     container = get_container(sandbox_id)
+    wrapped = f"timeout {timeout} bash -c {shlex.quote(command)}"
     start = time.monotonic()
     exit_code, output = container.exec_run(
-        ["bash", "-c", command],
-        demux=True,  # separate stdout/stderr
+        ["bash", "-c", wrapped],
+        demux=True,
     )
     duration_ms = int((time.monotonic() - start) * 1000)
 
@@ -27,11 +30,18 @@ def exec_command(sandbox_id: str, command: str, timeout: int = 30) -> ExecResult
     )
 
 
+async def exec_command(sandbox_id: str, command: str, timeout: int = 30) -> ExecResult:
+    return await asyncio.wait_for(
+        asyncio.to_thread(_exec_sync, sandbox_id, command, timeout),
+        timeout=timeout + 5,  # async fallback: 5s grace over container-level timeout
+    )
+
+
 async def stream_command(sandbox_id: str, websocket: WebSocket):
+    """Stream stays as-is — it already yields to the event loop via await websocket.send_json."""
     await websocket.accept()
 
     try:
-        # Wait for the command from the client
         msg = await websocket.receive_text()
         data = json.loads(msg)
         command = data.get("command", "")
@@ -43,7 +53,6 @@ async def stream_command(sandbox_id: str, websocket: WebSocket):
 
         container = get_container(sandbox_id)
 
-        # Create exec instance with streaming
         exec_instance = container.client.api.exec_create(
             container.id,
             ["bash", "-c", command],
@@ -51,14 +60,29 @@ async def stream_command(sandbox_id: str, websocket: WebSocket):
             stderr=True,
         )
 
-        output = container.client.api.exec_start(exec_instance["Id"], stream=True)
+        # Run the blocking iterator in a thread, push chunks to a queue
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
 
-        for chunk in output:
-            text = chunk.decode("utf-8", errors="replace")
+        def _stream():
+            output = container.client.api.exec_start(exec_instance["Id"], stream=True)
+            for chunk in output:
+                text = chunk.decode("utf-8", errors="replace")
+                queue.put_nowait(text)
+            queue.put_nowait(None)  # sentinel
+
+        stream_task = asyncio.get_event_loop().run_in_executor(None, _stream)
+
+        while True:
+            text = await queue.get()
+            if text is None:
+                break
             await websocket.send_json({"type": "stdout", "data": text})
 
-        # Get exit code
-        inspect = container.client.api.exec_inspect(exec_instance["Id"])
+        await stream_task  # ensure thread is done
+
+        inspect = await asyncio.to_thread(
+            container.client.api.exec_inspect, exec_instance["Id"]
+        )
         exit_code = inspect.get("ExitCode", -1)
         await websocket.send_json({"type": "exit", "data": str(exit_code)})
 

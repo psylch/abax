@@ -1,0 +1,23 @@
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    ports:
+      - "8000:8000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/abax-persistent:/tmp/abax-persistent
+    environment:
+      - ABAX_SANDBOX_IMAGE=abax-sandbox
+      - ABAX_SIGN_SECRET=${ABAX_SIGN_SECRET:-dev-secret-change-in-prod}
+    depends_on:
+      sandbox-image:
+        condition: service_completed_successfully
+
+  sandbox-image:
+    image: abax-sandbox
+    build:
+      context: ./sandbox-image
+      dockerfile: Dockerfile
+    entrypoint: ["echo", "image built"]
