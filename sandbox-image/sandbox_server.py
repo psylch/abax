@@ -5,7 +5,6 @@ Provides HTTP endpoints for:
 - Command execution (sync + streaming via WebSocket)
 - Browser automation (Playwright)
 - Health checks
-- Agent turn (ReAct loop)
 
 Runs on 0.0.0.0:8331 and is started as the container entrypoint.
 """
@@ -327,201 +326,82 @@ async def get_content(mode: str = "text"):
     return {"content": content, "url": _page.url, "title": await _page.title()}
 
 
+import uuid as _uuid
+
 # ---------------------------------------------------------------------------
-# Agent turn endpoint -- ReAct loop running locally inside the container
+# Persistent bash sessions
 # ---------------------------------------------------------------------------
 
-
-class AgentTurnRequest(BaseModel):
-    messages: list[dict]
-    system_prompt: str
-    tools: list[dict]
-    first_response: dict  # The initial LLM response (may contain tool_use)
-    model: str = "claude-sonnet-4-20250514"
-    max_turns: int = 20
-    gateway_url: str = "http://host.docker.internal:8000"
+_bash_sessions: dict[str, asyncio.subprocess.Process] = {}
 
 
-def _format_exec_result(result: dict) -> str:
-    """Format an exec result into a readable string."""
-    parts = []
-    if result.get("stdout"):
-        parts.append(result["stdout"])
-    if result.get("stderr"):
-        parts.append(f"[stderr] {result['stderr']}")
-    if result.get("exit_code", 0) != 0:
-        parts.append(f"[exit code: {result['exit_code']}]")
-    return "\n".join(parts) if parts else "(no output)"
+class BashRunRequest(BaseModel):
+    command: str
+    timeout: int = 30
 
 
-async def _local_tool_exec(name: str, params: dict) -> str:
-    """Execute a tool locally inside the container."""
-    if name == "execute_command":
-        command = params.get("command", "")
-        timeout = params.get("timeout", 30)
-        try:
-            result = await _run_command(command, timeout)
-            return _format_exec_result(result)
-        except Exception as e:
-            return f"Error: {e}"
-
-    elif name == "write_file":
-        path = params.get("path", "")
-        content = params.get("content", "")
-        try:
-            p = Path(path)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(content, encoding="utf-8")
-            return f"Wrote {len(content)} characters to {path}"
-        except Exception as e:
-            return f"Error: {e}"
-
-    elif name == "read_file":
-        path = params.get("path", "")
-        try:
-            return Path(path).read_text(encoding="utf-8", errors="replace")
-        except Exception as e:
-            return f"Error: {e}"
-
-    elif name == "list_files":
-        path = params.get("path", "/workspace")
-        try:
-            p = Path(path)
-            if not p.is_dir():
-                return f"Error: not a directory: {path}"
-            lines = []
-            for entry in sorted(p.iterdir(), key=lambda e: e.name):
-                kind = "dir" if entry.is_dir() else "file"
-                try:
-                    size = "" if entry.is_dir() else str(entry.stat().st_size)
-                except OSError:
-                    size = ""
-                lines.append(f"  {kind}  {entry.name}  {size}")
-            return "\n".join(lines) if lines else "(empty directory)"
-        except Exception as e:
-            return f"Error: {e}"
-
-    elif name == "browser_navigate":
-        try:
-            await _ensure_browser()
-            url = params.get("url", "")
-            await _page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            return json.dumps({"title": await _page.title(), "url": _page.url})
-        except Exception as e:
-            return f"Error: {e}"
-
-    elif name == "browser_screenshot":
-        try:
-            await _ensure_browser()
-            data = await _page.screenshot(full_page=False)
-            return f"Screenshot taken (png, {len(data)} bytes)"
-        except Exception as e:
-            return f"Error: {e}"
-
-    elif name == "browser_content":
-        try:
-            await _ensure_browser()
-            mode = params.get("mode", "text")
-            if mode == "html":
-                content = await _page.content()
-            else:
-                content = await _page.inner_text("body")
-            if len(content) > 10000:
-                content = content[:10000] + "\n... (truncated)"
-            return content
-        except Exception as e:
-            return f"Error: {e}"
-
-    else:
-        return f"Unknown tool: {name}"
+@app.post("/bash/create")
+async def create_bash():
+    """Create a persistent bash process."""
+    bash_id = _uuid.uuid4().hex[:12]
+    proc = await asyncio.create_subprocess_exec(
+        "bash", "--norc", "--noprofile",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    _bash_sessions[bash_id] = proc
+    return {"bash_id": bash_id}
 
 
-async def _call_llm(gateway_url: str, body: dict) -> dict:
-    """Call LLM via the gateway's /llm/proxy endpoint."""
-    import httpx
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(
-            f"{gateway_url}/llm/proxy",
-            json=body,
-        )
-        resp.raise_for_status()
-        return resp.json()
+@app.post("/bash/{bash_id}/run")
+async def bash_run(bash_id: str, req: BashRunRequest):
+    """Run a command in an existing bash session."""
+    proc = _bash_sessions.get(bash_id)
+    if proc is None or proc.returncode is not None:
+        return {"error": f"bash session {bash_id} not found", "status": 404}
+
+    # Use a unique delimiter to detect end of output
+    delimiter = f"__ABAX_END_{_uuid.uuid4().hex[:8]}__"
+    full_cmd = f"{req.command}\necho {delimiter} $?\n"
+
+    proc.stdin.write(full_cmd.encode())
+    await proc.stdin.drain()
+
+    # Read until we see the delimiter
+    output_lines = []
+    exit_code = 0
+    try:
+        async with asyncio.timeout(req.timeout):
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    exit_code = -1
+                    break
+                decoded = line.decode("utf-8", errors="replace").rstrip("\n")
+                if decoded.startswith(delimiter):
+                    parts = decoded.split()
+                    exit_code = int(parts[1]) if len(parts) > 1 else 0
+                    break
+                output_lines.append(decoded)
+    except TimeoutError:
+        return {"stdout": "\n".join(output_lines), "stderr": "command timed out", "exit_code": 124}
+
+    return {"stdout": "\n".join(output_lines), "stderr": "", "exit_code": exit_code}
 
 
-@app.post("/agent/turn")
-async def agent_turn(req: AgentTurnRequest):
-    """Run a ReAct agent loop locally inside the container.
-
-    Uses first_response from Gateway's initial LLM call, then continues
-    tool execution locally until the LLM returns pure text.
-    """
-    messages = list(req.messages)
-    turns = []
-    tool_calls_count = 0
-    response = req.first_response
-
-    for _ in range(req.max_turns):
-        # Extract content blocks
-        assistant_content = response.get("content", [])
-        tool_use_blocks = [b for b in assistant_content if b.get("type") == "tool_use"]
-        text_blocks = [b for b in assistant_content if b.get("type") == "text"]
-
-        # Record assistant turn
-        text = "\n".join(b["text"] for b in text_blocks)
-        turn_record = {"role": "assistant", "text": text}
-        if tool_use_blocks:
-            turn_record["tool_calls"] = tool_use_blocks
-        turns.append(turn_record)
-
-        # Add assistant message to conversation
-        messages.append({"role": "assistant", "content": assistant_content})
-
-        # If no tool use, we're done
-        stop_reason = response.get("stop_reason", "end_turn")
-        if stop_reason == "end_turn" or not tool_use_blocks:
-            break
-
-        # Execute tools locally
-        tool_results = []
-        for block in tool_use_blocks:
-            tool_calls_count += 1
-            result_text = await _local_tool_exec(block["name"], block.get("input", {}))
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": block["id"],
-                "content": result_text,
-            })
-
-        turns.append({"role": "tool_results", "results": tool_results})
-        messages.append({"role": "user", "content": tool_results})
-
-        # Call LLM again via gateway proxy
-        try:
-            response = await _call_llm(req.gateway_url, {
-                "model": req.model,
-                "max_tokens": 4096,
-                "system": req.system_prompt,
-                "messages": messages,
-                "tools": req.tools,
-            })
-        except Exception as e:
-            return {
-                "response": f"(LLM call failed: {e})",
-                "turns": turns,
-                "tool_calls_count": tool_calls_count,
-            }
-
-    # Extract final text
-    final_texts = [
-        b["text"] for b in response.get("content", []) if b.get("type") == "text"
-    ]
-    final_response = "\n".join(final_texts) if final_texts else "(no response)"
-
-    return {
-        "response": final_response,
-        "turns": turns,
-        "tool_calls_count": tool_calls_count,
-    }
+@app.delete("/bash/{bash_id}")
+async def delete_bash(bash_id: str):
+    """Close a persistent bash session."""
+    proc = _bash_sessions.pop(bash_id, None)
+    if proc is None:
+        return {"error": f"bash session {bash_id} not found", "status": 404}
+    proc.kill()
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5)
+    except asyncio.TimeoutError:
+        pass
+    return {"ok": True}
 
 
 if __name__ == "__main__":
