@@ -1,4 +1,4 @@
-.PHONY: image infra test e2e clean dev
+.PHONY: image infra agent test test-agent e2e clean dev
 
 # 构建沙箱镜像
 image:
@@ -8,9 +8,17 @@ image:
 infra: image
 	uvicorn infra.api.main:app --reload --port 8000
 
+# 启动 Agent（TypeScript）
+agent:
+	cd agent-ts && npx tsx src/index.ts
+
 # 跑 Infra 测试（自动确保镜像已构建）
 test: image
 	ABAX_POOL_SIZE=0 pytest tests/infra/ -v
+
+# 跑 Agent 测试（TypeScript）
+test-agent:
+	cd agent-ts && npx vitest run
 
 # E2E 测试（agent 层，参考用）
 e2e: image
